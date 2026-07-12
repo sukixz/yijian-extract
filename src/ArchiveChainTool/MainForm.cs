@@ -22,6 +22,9 @@ internal sealed class MainForm : Form
     private readonly TextBox _log = new();
     private readonly Button _run = new() { Text = "开始批处理", Width = 110 };
     private readonly Button _cancel = new() { Text = "取消全部", Width = 90, Enabled = false };
+    private readonly Button _addFiles = new() { Text = "添加文件", AutoSize = true };
+    private readonly Button _clearQueue = new() { Text = "清空队列", AutoSize = true };
+    private readonly Button _browseOutput = new() { Text = "浏览...", AutoSize = true };
     private readonly List<string> _inputs = [];
     private readonly PasswordManagerControl _passwordManager;
     private readonly TemplateStore _templateStore;
@@ -35,7 +38,7 @@ internal sealed class MainForm : Form
     {
         _passwordManager = new PasswordManagerControl(_baseDirectory);
         _templateStore = new TemplateStore(_baseDirectory);
-        Text = "熠键解压 v3.1";
+        Text = "熠键解压 v3.1.1";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1100, 720);
         Size = new Size(1280, 850);
@@ -81,9 +84,12 @@ internal sealed class MainForm : Form
         options.Controls.Add(new Label { Text = "输出根目录", AutoSize = true, Margin = new Padding(16, 7, 2, 0) });
         _output.Width = 320;
         options.Controls.Add(_output);
-        options.Controls.Add(Button("浏览...", (_, _) => BrowseOutput()));
-        options.Controls.Add(Button("添加文件", (_, _) => BrowseInputs()));
-        options.Controls.Add(Button("清空队列", (_, _) => { _inputs.Clear(); RefreshQueue(); }));
+        _browseOutput.Click += (_, _) => BrowseOutput();
+        _addFiles.Click += (_, _) => BrowseInputs();
+        _clearQueue.Click += (_, _) => { _inputs.Clear(); RefreshQueue(); };
+        options.Controls.Add(_browseOutput);
+        options.Controls.Add(_addFiles);
+        options.Controls.Add(_clearQueue);
         _automatic.CheckedChanged += (_, _) => { _workflow.ExecutionMode = _automatic.Checked ? ExecutionMode.AutomaticChain : ExecutionMode.CustomWorkflow; _steps.Enabled = _stepEditor.Enabled = !_automatic.Checked; };
         _maxLayers.ValueChanged += (_, _) => _workflow.Automatic.MaxLayers = (int)_maxLayers.Value;
         _workflowName.TextChanged += (_, _) => _workflow.Name = _workflowName.Text;
@@ -246,22 +252,29 @@ internal sealed class MainForm : Form
             var sevenZip = Path.Combine(_baseDirectory, "tools", "7zip", "7z.exe");
             var successes = 0;
             var failures = new List<WorkflowRunResult>();
-            for (var i = 0; i < _inputs.Count; i++)
+            var batchInputs = _inputs.ToArray();
+            for (var i = 0; i < batchInputs.Length; i++)
             {
                 if (_cancellation.IsCancellationRequested) break;
-                SetQueueStatus(i, "运行中", "");
+                var rowIndex = i;
+                var inputPath = batchInputs[i];
+                SetQueueStatus(rowIndex, "运行中", "");
                 try
                 {
                     var engine = new WorkflowEngine(ChooseCandidateAsync, RequestPasswordAsync, _passwordManager.Entries);
-                    var progress = new Progress<WorkflowProgress>(p => { SetQueueStatus(i, $"{p.StepIndex}/{p.StepCount}", p.Message); AppendLog($"[{i + 1}/{_inputs.Count}] {p.Message}"); });
-                    var result = await engine.RunAsync(_workflow, _inputs[i], _output.Text, sevenZip, progress, _cancellation.Token);
+                    var progress = new Progress<WorkflowProgress>(p =>
+                    {
+                        SetQueueStatus(rowIndex, $"{p.StepIndex}/{p.StepCount}", p.Message);
+                        AppendLog($"[{rowIndex + 1}/{batchInputs.Length}] {p.Message}");
+                    });
+                    var result = await engine.RunAsync(_workflow, inputPath, _output.Text, sevenZip, progress, _cancellation.Token);
                     if (!_workflow.KeepIntermediateFiles) PromoteAndClean(result);
-                    SetQueueStatus(i, "成功", result.FinalArtifact);
+                    SetQueueStatus(rowIndex, "成功", result.FinalArtifact);
                     successes++;
                 }
-                catch (OperationCanceledException) { SetQueueStatus(i, "已取消", ""); }
-                catch (WorkflowRunException ex) { SetQueueStatus(i, "失败", ex.Message); failures.Add(new(ex.TaskDirectory, ex.TaskDirectory, ex.LogPath)); }
-                catch (Exception ex) { SetQueueStatus(i, "失败", ex.Message); }
+                catch (OperationCanceledException) { SetQueueStatus(rowIndex, "已取消", ""); }
+                catch (WorkflowRunException ex) { SetQueueStatus(rowIndex, "失败", ex.Message); failures.Add(new(ex.TaskDirectory, ex.TaskDirectory, ex.LogPath)); }
+                catch (Exception ex) { SetQueueStatus(rowIndex, "失败", ex.Message); }
             }
             if (failures.Count > 0 && MessageBox.Show(this, $"有 {failures.Count} 个任务失败。是否清理失败任务的中间文件？\n\n选择“否”将保留现场。", "失败任务清理", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
                 foreach (var failure in failures) CleanTaskWork(failure.TaskDirectory);
@@ -302,7 +315,12 @@ internal sealed class MainForm : Form
         foreach (var directory in Directory.EnumerateDirectories(source)) CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
     }
 
-    private void SetQueueStatus(int row, string status, string result) { _queue.Rows[row].Cells[3].Value = status; _queue.Rows[row].Cells[4].Value = result; }
+    private void SetQueueStatus(int row, string status, string result)
+    {
+        if (IsDisposed || row < 0 || row >= _queue.Rows.Count) return;
+        _queue.Rows[row].Cells[3].Value = status;
+        _queue.Rows[row].Cells[4].Value = result;
+    }
 
     private Task<string?> ChooseCandidateAsync(IReadOnlyList<string> candidates, string name)
     {
@@ -368,7 +386,17 @@ internal sealed class MainForm : Form
         BindWorkflowToUi();
     }
 
-    private void SetRunning(bool running) { _run.Enabled = !running; _cancel.Enabled = running; _automatic.Enabled = _maxLayers.Enabled = _keepAll.Enabled = _deleteOnSuccess.Enabled = !running; _steps.Enabled = _stepEditor.Enabled = !running && !_automatic.Checked; AllowDrop = !running; }
+    private void SetRunning(bool running)
+    {
+        _run.Enabled = !running;
+        _cancel.Enabled = running;
+        _addFiles.Enabled = _clearQueue.Enabled = _browseOutput.Enabled = !running;
+        _output.ReadOnly = running;
+        _queue.Enabled = !running;
+        _automatic.Enabled = _maxLayers.Enabled = _keepAll.Enabled = _deleteOnSuccess.Enabled = !running;
+        _steps.Enabled = _stepEditor.Enabled = !running && !_automatic.Checked;
+        AllowDrop = !running;
+    }
     private void AppendLog(string text) { _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}\r\n"); _log.SelectionStart = _log.TextLength; _log.ScrollToCaret(); }
 
     private void ReloadTemplates() { _templates = _templateStore.LoadAll(); _templateList.Items.Clear(); foreach (var t in _templates) _templateList.Items.Add((t.IsBuiltIn ? "[内置] " : "[用户] ") + t.Name); if (_templates.Count > 0) _templateList.SelectedIndex = 0; }
